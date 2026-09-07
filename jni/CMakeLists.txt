@@ -16,12 +16,11 @@ add_library(smollm_jni SHARED smollm_jni.cpp)
 
 target_link_libraries(smollm_jni
     llama
-    common
-    log
     android
+    log
 )
 
 target_include_directories(smollm_jni PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/ggml/include
 )
