@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <string>
 #include <vector>
+#include <atomic>
 
 #include "llama.h"
 
@@ -9,18 +10,19 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Holds everything needed for one loaded model + context.
 struct SmolLMSession {
     llama_model   *model   = nullptr;
     llama_context *ctx     = nullptr;
     llama_sampler *sampler = nullptr;
+    std::atomic<bool> stopRequested{false};
 };
 
 static bool g_backend_initialized = false;
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_example_smollmtest_SmolLM_nativeLoadModel(
-        JNIEnv *env, jobject /* this */, jstring modelPath, jint nThreads, jint nCtx) {
+        JNIEnv *env, jobject /* this */, jstring modelPath, jint nThreads, jint nCtx,
+        jfloat temperature) {
 
     if (!g_backend_initialized) {
         llama_backend_init();
@@ -30,7 +32,7 @@ Java_com_example_smollmtest_SmolLM_nativeLoadModel(
     const char *path = env->GetStringUTFChars(modelPath, nullptr);
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0; // CPU only for this test app
+    model_params.n_gpu_layers = 0;
 
     llama_model *model = llama_model_load_from_file(path, model_params);
     env->ReleaseStringUTFChars(modelPath, path);
@@ -52,15 +54,18 @@ Java_com_example_smollmtest_SmolLM_nativeLoadModel(
         return 0;
     }
 
-    // Simple greedy-ish sampler chain: top-k -> top-p -> temperature -> dist
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.8f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.8f));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    auto *session = new SmolLMSession{model, ctx, sampler};
+    auto *session = new SmolLMSession();
+    session->model = model;
+    session->ctx = ctx;
+    session->sampler = sampler;
+
     LOGI("Model loaded successfully, session=%p", session);
     return reinterpret_cast<jlong>(session);
 }
@@ -76,15 +81,21 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
         return;
     }
 
+    session->stopRequested = false;
+
     const char *prompt_cstr = env->GetStringUTFChars(prompt, nullptr);
     std::string prompt_str(prompt_cstr);
     env->ReleaseStringUTFChars(prompt, prompt_cstr);
 
     const llama_vocab *vocab = llama_model_get_vocab(session->model);
 
-    // Tokenize prompt
     int n_prompt_tokens = -llama_tokenize(vocab, prompt_str.c_str(), (int32_t) prompt_str.size(),
                                            nullptr, 0, true, true);
+    if (n_prompt_tokens <= 0) {
+        LOGE("Prompt tokenization returned invalid size: %d", n_prompt_tokens);
+        return;
+    }
+
     std::vector<llama_token> tokens(n_prompt_tokens);
     if (llama_tokenize(vocab, prompt_str.c_str(), (int32_t) prompt_str.size(),
                         tokens.data(), (int32_t) tokens.size(), true, true) < 0) {
@@ -94,13 +105,17 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
 
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
 
-    // Look up the Java callback method: void onToken(String)
     jclass callbackClass = env->GetObjectClass(callback);
     jmethodID onTokenMethod = env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
 
     char piece_buf[256];
 
     for (int i = 0; i < maxTokens; i++) {
+        if (session->stopRequested.load()) {
+            LOGI("Stop requested, halting generation at step %d", i);
+            break;
+        }
+
         if (llama_decode(session->ctx, batch) != 0) {
             LOGE("llama_decode failed at step %d", i);
             break;
@@ -124,8 +139,18 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
         env->CallVoidMethod(callback, onTokenMethod, jpiece);
         env->DeleteLocalRef(jpiece);
 
-        // Prepare next batch with just the new token
         batch = llama_batch_get_one(&new_token, 1);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_smollmtest_SmolLM_nativeStop(
+        JNIEnv *env, jobject /* this */, jlong sessionPtr) {
+
+    auto *session = reinterpret_cast<SmolLMSession *>(sessionPtr);
+    if (session) {
+        session->stopRequested = true;
+        LOGI("Stop flag set for session=%p", session);
     }
 }
 
