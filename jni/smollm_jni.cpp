@@ -10,11 +10,17 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+struct ChatTurn {
+    std::string role;
+    std::string content;
+};
+
 struct SmolLMSession {
     llama_model   *model   = nullptr;
     llama_context *ctx     = nullptr;
     llama_sampler *sampler = nullptr;
     std::atomic<bool> stopRequested{false};
+    std::vector<ChatTurn> history;
 };
 
 static bool g_backend_initialized = false;
@@ -54,8 +60,15 @@ Java_com_example_smollmtest_SmolLM_nativeLoadModel(
         return 0;
     }
 
+    // Sampler chain order matters: penalties must run BEFORE top-k/top-p/temp,
+    // otherwise they'd penalize an already-truncated candidate set.
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+            64,     // penalty_last_n: how many recent tokens count toward the penalty
+            1.1f,   // penalty_repeat: >1.0 discourages repeats, keep modest (never exceed ~1.2)
+            0.0f,   // penalty_freq: disabled
+            0.0f)); // penalty_present: disabled
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.8f));
@@ -87,19 +100,25 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     std::string user_prompt(prompt_cstr);
     env->ReleaseStringUTFChars(prompt, prompt_cstr);
 
-    // --- Apply the model's chat template so it recognizes this as an instruct turn ---
-    llama_chat_message chat_msg[1];
-    chat_msg[0].role = "user";
-    chat_msg[0].content = user_prompt.c_str();
+    // Append this turn to persistent history BEFORE formatting, so the model sees full context.
+    session->history.push_back({"user", user_prompt});
 
-    const char *tmpl = llama_model_chat_template(session->model, nullptr); // nullptr = default template
+    // Build the llama_chat_message array from history. Pointers must stay valid
+    // for the duration of this call, which they are since `history` strings are stable.
+    std::vector<llama_chat_message> chat_msgs;
+    chat_msgs.reserve(session->history.size());
+    for (const auto &turn : session->history) {
+        chat_msgs.push_back({turn.role.c_str(), turn.content.c_str()});
+    }
 
-    std::vector<char> formatted(user_prompt.size() * 4 + 256);
+    const char *tmpl = llama_model_chat_template(session->model, nullptr);
+
+    std::vector<char> formatted(user_prompt.size() * 4 + 1024);
     int32_t formatted_len = llama_chat_apply_template(
             tmpl,
-            chat_msg,
-            1,
-            true,      // add_ass: append the assistant-turn prefix
+            chat_msgs.data(),
+            chat_msgs.size(),
+            true, // add_ass
             formatted.data(),
             (int32_t) formatted.size());
 
@@ -111,13 +130,13 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     } else {
         if ((size_t) formatted_len > formatted.size()) {
             formatted.resize(formatted_len);
-            llama_chat_apply_template(tmpl, chat_msg, 1, true,
+            llama_chat_apply_template(tmpl, chat_msgs.data(), chat_msgs.size(), true,
                                        formatted.data(), formatted_len);
         }
         prompt_str.assign(formatted.data(), formatted_len);
     }
 
-    LOGI("Formatted prompt: %s", prompt_str.c_str());
+    LOGI("Formatted prompt (%zu history turns): %s", session->history.size(), prompt_str.c_str());
 
     const llama_vocab *vocab = llama_model_get_vocab(session->model);
 
@@ -125,6 +144,7 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
                                            nullptr, 0, true, true);
     if (n_prompt_tokens <= 0) {
         LOGE("Prompt tokenization returned invalid size: %d", n_prompt_tokens);
+        session->history.pop_back(); // roll back the turn we couldn't process
         return;
     }
 
@@ -132,7 +152,32 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     if (llama_tokenize(vocab, prompt_str.c_str(), (int32_t) prompt_str.size(),
                         tokens.data(), (int32_t) tokens.size(), true, true) < 0) {
         LOGE("Tokenization failed");
+        session->history.pop_back();
         return;
+    }
+
+    // Guard against exceeding context size as history grows over many turns.
+    int n_ctx = llama_n_ctx(session->ctx);
+    if ((int) tokens.size() >= n_ctx - 8) {
+        LOGE("Prompt+history (%d tokens) too close to context limit (%d). Trimming oldest turns.",
+             (int) tokens.size(), n_ctx);
+        // Simple strategy: drop oldest turns (keep at least the current one) and retry once.
+        while (session->history.size() > 1 && (int) tokens.size() >= n_ctx - 8) {
+            session->history.erase(session->history.begin());
+            chat_msgs.clear();
+            for (const auto &turn : session->history) {
+                chat_msgs.push_back({turn.role.c_str(), turn.content.c_str()});
+            }
+            formatted_len = llama_chat_apply_template(tmpl, chat_msgs.data(), chat_msgs.size(),
+                                                        true, formatted.data(), (int32_t) formatted.size());
+            if (formatted_len < 0) break;
+            prompt_str.assign(formatted.data(), formatted_len);
+            n_prompt_tokens = -llama_tokenize(vocab, prompt_str.c_str(), (int32_t) prompt_str.size(),
+                                               nullptr, 0, true, true);
+            tokens.resize(n_prompt_tokens);
+            llama_tokenize(vocab, prompt_str.c_str(), (int32_t) prompt_str.size(),
+                            tokens.data(), (int32_t) tokens.size(), true, true);
+        }
     }
 
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
@@ -141,6 +186,7 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     jmethodID onTokenMethod = env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
 
     char piece_buf[256];
+    std::string assistantReply;
 
     for (int i = 0; i < maxTokens; i++) {
         if (session->stopRequested.load()) {
@@ -154,6 +200,7 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
         }
 
         llama_token new_token = llama_sampler_sample(session->sampler, session->ctx, -1);
+        llama_sampler_accept(session->sampler, new_token); // feeds the penalty tracker
 
         if (llama_vocab_is_eog(vocab, new_token)) {
             LOGI("EOG token reached, stopping generation");
@@ -166,12 +213,27 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
             break;
         }
         std::string piece(piece_buf, n);
+        assistantReply += piece;
 
         jstring jpiece = env->NewStringUTF(piece.c_str());
         env->CallVoidMethod(callback, onTokenMethod, jpiece);
         env->DeleteLocalRef(jpiece);
 
         batch = llama_batch_get_one(&new_token, 1);
+    }
+
+    // Persist the assistant's reply into history so the NEXT turn has full context.
+    session->history.push_back({"assistant", assistantReply});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_smollmtest_SmolLM_nativeClearHistory(
+        JNIEnv *env, jobject /* this */, jlong sessionPtr) {
+
+    auto *session = reinterpret_cast<SmolLMSession *>(sessionPtr);
+    if (session) {
+        session->history.clear();
+        LOGI("Conversation history cleared for session=%p", session);
     }
 }
 
