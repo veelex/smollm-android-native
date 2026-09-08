@@ -84,8 +84,38 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     session->stopRequested = false;
 
     const char *prompt_cstr = env->GetStringUTFChars(prompt, nullptr);
-    std::string prompt_str(prompt_cstr);
+    std::string user_prompt(prompt_cstr);
     env->ReleaseStringUTFChars(prompt, prompt_cstr);
+
+    // --- Apply the model's chat template so it recognizes this as an instruct turn ---
+    llama_chat_message chat_msg[1];
+    chat_msg[0].role = "user";
+    chat_msg[0].content = user_prompt.c_str();
+
+    std::vector<char> formatted(user_prompt.size() * 4 + 256);
+    int32_t formatted_len = llama_chat_apply_template(
+            session->model,
+            nullptr,   // nullptr = use the template embedded in the GGUF metadata
+            chat_msg,
+            1,
+            true,      // add_ass: append the assistant-turn prefix, so the model knows to reply next
+            formatted.data(),
+            (int32_t) formatted.size());
+
+    std::string prompt_str;
+    if (formatted_len < 0) {
+        LOGE("llama_chat_apply_template failed, falling back to raw prompt");
+        prompt_str = user_prompt;
+    } else {
+        if ((size_t) formatted_len > formatted.size()) {
+            formatted.resize(formatted_len);
+            llama_chat_apply_template(session->model, nullptr, chat_msg, 1, true,
+                                       formatted.data(), formatted_len);
+        }
+        prompt_str.assign(formatted.data(), formatted_len);
+    }
+
+    LOGI("Formatted prompt: %s", prompt_str.c_str());
 
     const llama_vocab *vocab = llama_model_get_vocab(session->model);
 
