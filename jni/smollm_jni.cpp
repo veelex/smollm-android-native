@@ -92,24 +92,26 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     chat_msg[0].role = "user";
     chat_msg[0].content = user_prompt.c_str();
 
+    const char *tmpl = llama_model_chat_template(session->model, nullptr); // nullptr = default template
+
     std::vector<char> formatted(user_prompt.size() * 4 + 256);
     int32_t formatted_len = llama_chat_apply_template(
-            session->model,
-            nullptr,   // nullptr = use the template embedded in the GGUF metadata
+            tmpl,
             chat_msg,
             1,
-            true,      // add_ass: append the assistant-turn prefix, so the model knows to reply next
+            true,      // add_ass: append the assistant-turn prefix
             formatted.data(),
             (int32_t) formatted.size());
 
     std::string prompt_str;
     if (formatted_len < 0) {
-        LOGE("llama_chat_apply_template failed, falling back to raw prompt");
+        LOGE("llama_chat_apply_template failed (tmpl=%s), falling back to raw prompt",
+             tmpl ? tmpl : "null");
         prompt_str = user_prompt;
     } else {
         if ((size_t) formatted_len > formatted.size()) {
             formatted.resize(formatted_len);
-            llama_chat_apply_template(session->model, nullptr, chat_msg, 1, true,
+            llama_chat_apply_template(tmpl, chat_msg, 1, true,
                                        formatted.data(), formatted_len);
         }
         prompt_str.assign(formatted.data(), formatted_len);
