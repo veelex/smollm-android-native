@@ -60,11 +60,14 @@ Java_com_example_smollmtest_SmolLM_nativeLoadModel(
         return 0;
     }
 
+    int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
     // Sampler chain order matters: penalties must run BEFORE top-k/top-p/temp,
     // otherwise they'd penalize an already-truncated candidate set.
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+            n_vocab,
             64,     // penalty_last_n: how many recent tokens count toward the penalty
             1.1f,   // penalty_repeat: >1.0 discourages repeats, keep modest (never exceed ~1.2)
             0.0f,   // penalty_freq: disabled
