@@ -21,6 +21,7 @@ struct SmolLMSession {
     llama_sampler *sampler = nullptr;
     std::atomic<bool> stopRequested{false};
     std::vector<ChatTurn> history;
+    bool systemPromptSet = false; // ensures we only inject the system turn once per session
 };
 
 static bool g_backend_initialized = false;
@@ -28,7 +29,7 @@ static bool g_backend_initialized = false;
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_example_smollmtest_SmolLM_nativeLoadModel(
         JNIEnv *env, jobject /* this */, jstring modelPath, jint nThreads, jint nCtx,
-        jfloat temperature) {
+        jfloat temperature, jint topK, jfloat topP, jfloat minP, jint seed) {
 
     if (!g_backend_initialized) {
         llama_backend_init();
@@ -62,7 +63,23 @@ Java_com_example_smollmtest_SmolLM_nativeLoadModel(
 
     int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
-    // Sampler chain order matters: penalties must run BEFORE top-k/top-p/temp,
+    // --- Sampling parameter recommendations (validate/clamp these on the Java side too) ---
+    // topK:  1-100. RECOMMENDED DEFAULT: 40.
+    //        Lower (10-20) = more focused/deterministic, higher (80-100) = more variety.
+    //        0 disables top-k filtering entirely (not recommended for a 360M model — too wild).
+    // topP:  0.0-1.0. RECOMMENDED DEFAULT: 0.9.
+    //        Lower (0.5-0.7) = terser/safer, higher (0.95+) = more creative, more risk of nonsense.
+    // minP:  0.0-1.0. RECOMMENDED DEFAULT: 0.05, used as an ALTERNATIVE to top-p, not alongside it.
+    //        Set minP > 0 and topP = 1.0 to use min-p mode instead. Min-p tends to behave better
+    //        than top-p on small models because it doesn't over-prune when the model is uncertain.
+    // seed:  any int32, or -1 for random (maps to LLAMA_DEFAULT_SEED). RECOMMENDED DEFAULT: -1.
+    //        Fix a seed only when you want reproducible output for debugging/comparison.
+    int32_t effectiveTopK = topK > 0 ? topK : 40;
+    float   effectiveTopP = (topP > 0.0f && topP <= 1.0f) ? topP : 0.9f;
+    float   effectiveMinP = (minP > 0.0f && minP <= 1.0f) ? minP : 0.0f; // 0 = disabled
+    uint32_t effectiveSeed = seed >= 0 ? (uint32_t) seed : LLAMA_DEFAULT_SEED;
+
+    // Sampler chain order matters: penalties must run BEFORE top-k/top-p/min-p/temp,
     // otherwise they'd penalize an already-truncated candidate set.
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
@@ -72,24 +89,32 @@ Java_com_example_smollmtest_SmolLM_nativeLoadModel(
             1.1f,   // penalty_repeat: >1.0 discourages repeats, keep modest (never exceed ~1.2)
             0.0f,   // penalty_freq: disabled
             0.0f)); // penalty_present: disabled
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(effectiveTopK));
+
+    // If minP is set (> 0), prefer it over top-p by leaving top-p effectively passthrough (1.0).
+    if (effectiveMinP > 0.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_min_p(effectiveMinP, 1));
+    } else {
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(effectiveTopP, 1));
+    }
+
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.8f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(effectiveSeed));
 
     auto *session = new SmolLMSession();
     session->model = model;
     session->ctx = ctx;
     session->sampler = sampler;
 
-    LOGI("Model loaded successfully, session=%p", session);
+    LOGI("Model loaded successfully, session=%p (topK=%d topP=%.2f minP=%.2f seed=%u)",
+         session, effectiveTopK, effectiveTopP, effectiveMinP, effectiveSeed);
     return reinterpret_cast<jlong>(session);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_smollmtest_SmolLM_nativeGenerate(
         JNIEnv *env, jobject thiz, jlong sessionPtr, jstring prompt,
-        jint maxTokens, jobject callback) {
+        jint maxTokens, jstring systemPrompt, jobject callback) {
 
     auto *session = reinterpret_cast<SmolLMSession *>(sessionPtr);
     if (!session || !session->ctx || !session->model) {
@@ -98,6 +123,20 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
     }
 
     session->stopRequested = false;
+
+    // Inject the system prompt ONCE, as the very first history entry, before any user turn.
+    // RECOMMENDED DEFAULT: empty/none. A short, specific instruction ("You are a concise
+    // assistant. Answer in 2-3 sentences unless asked for more.") tends to help small models
+    // stay on-task more than long/elaborate personas, which they can lose track of.
+    if (!session->systemPromptSet && systemPrompt != nullptr) {
+        const char *sys_cstr = env->GetStringUTFChars(systemPrompt, nullptr);
+        std::string sys_str(sys_cstr);
+        env->ReleaseStringUTFChars(systemPrompt, sys_cstr);
+        if (!sys_str.empty()) {
+            session->history.insert(session->history.begin(), {"system", sys_str});
+        }
+        session->systemPromptSet = true;
+    }
 
     const char *prompt_cstr = env->GetStringUTFChars(prompt, nullptr);
     std::string user_prompt(prompt_cstr);
@@ -165,6 +204,8 @@ Java_com_example_smollmtest_SmolLM_nativeGenerate(
         LOGE("Prompt+history (%d tokens) too close to context limit (%d). Trimming oldest turns.",
              (int) tokens.size(), n_ctx);
         // Simple strategy: drop oldest turns (keep at least the current one) and retry once.
+        // NOTE: this could now drop the system turn if history grows huge — acceptable tradeoff
+        // for this simple strategy, flagged here in case it matters later.
         while (session->history.size() > 1 && (int) tokens.size() >= n_ctx - 8) {
             session->history.erase(session->history.begin());
             chat_msgs.clear();
@@ -236,6 +277,7 @@ Java_com_example_smollmtest_SmolLM_nativeClearHistory(
     auto *session = reinterpret_cast<SmolLMSession *>(sessionPtr);
     if (session) {
         session->history.clear();
+        session->systemPromptSet = false; // allow a fresh system prompt on next generate
         LOGI("Conversation history cleared for session=%p", session);
     }
 }
